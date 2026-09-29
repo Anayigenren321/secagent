@@ -2,6 +2,7 @@ import subprocess
 import os
 import re
 import time
+import shutil
 import tempfile
 from tools.base import BaseTool
 
@@ -9,28 +10,39 @@ from tools.base import BaseTool
 SCAN_MODES = {
     "fast": {
         "name": "⚡ 快速扫描",
-        "timeout": 120,
+        "timeout": 180,
         "args": ["-t", "http/misconfiguration/"],
-        "desc": "30-60秒",
+        "desc": "配置检查（1-3分钟）",
     },
     "standard": {
         "name": "🔍 标准扫描",
-        "timeout": 600,
-        "args": ["-t", "http/misconfiguration/", "-t", "http/exposures/"],
-        "desc": "3-5分钟",
+        "timeout": 900,
+        "args": [
+            "-t", "http/misconfiguration/",
+            "-t", "http/exposures/",
+            "-t", "http/exposed-panels/",
+            "-t", "http/default-logins/",
+            "-t", "http/vulnerabilities/",
+        ],
+        "desc": "含常见漏洞（5-10分钟）",
     },
     "deep": {
         "name": "🎯 深度扫描",
         "timeout": 1800,
-        "args": [],
-        "desc": "30分钟",
+        "args": [
+            "-t", "http/misconfiguration/",
+            "-t", "http/exposures/",
+            "-t", "http/exposed-panels/",
+            "-t", "http/default-logins/",
+            "-t", "http/vulnerabilities/",
+            "-t", "http/cves/2024/",
+        ],
+        "desc": "全量扫描（10-30分钟）",
     },
 }
-
-
 class NucleiTool(BaseTool):
     name = "nuclei"
-    description = "基于模板的漏洞扫描器"
+    description = "基于模板的漏洞扫描器，仿安恒明鉴分层扫描"
 
     def __init__(self, progress_callback=None):
         self.progress_callback = progress_callback
@@ -40,6 +52,17 @@ class NucleiTool(BaseTool):
             self.progress_callback(message, percent)
         print(message)
 
+    def _clear_cache(self):
+        """清空 Nuclei 缓存，避免漏报"""
+        cache_dirs = [
+            os.path.expanduser("~/.cache/nuclei"),
+            os.path.expanduser("~/.config/nuclei/cache"),
+        ]
+        for d in cache_dirs:
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"[DEBUG] 已清空缓存: {d}")
+
     def run(self, target: str, mode: str = "fast", **kwargs) -> dict:
         if mode not in SCAN_MODES:
             mode = "fast"
@@ -47,7 +70,9 @@ class NucleiTool(BaseTool):
         config = SCAN_MODES[mode]
         output_file = tempfile.mktemp(suffix=".txt")
 
-        # 核心命令：最朴素版本
+        # ========== 关键：每次扫描前清空缓存 ==========
+        self._clear_cache()
+
         cmd = [
             "nuclei",
             "-u", target,
@@ -84,8 +109,6 @@ class NucleiTool(BaseTool):
                 with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 print(f"[DEBUG] 文件大小: {len(content)}")
-                if content:
-                    print(f"[DEBUG] 文件前500:\n{content[:500]}")
 
                 pattern = re.compile(
                     r"^\[([^\]]+)\]\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+(\S+)(.*)$"
@@ -110,8 +133,13 @@ class NucleiTool(BaseTool):
 
         except subprocess.TimeoutExpired:
             error_msg = f"扫描超时（{config['timeout']}秒）"
+            self._report(f"    [!] {error_msg}", 100)
+        except FileNotFoundError:
+            error_msg = "Nuclei 未安装"
+            self._report(f"    [!] {error_msg}", 100)
         except Exception as e:
             error_msg = f"扫描异常: {e}"
+            self._report(f"    [!] {error_msg}", 100)
 
         elapsed = time.time() - start_time
         self._report(f"[*] 耗时: {elapsed:.1f} 秒", 90)
@@ -133,10 +161,16 @@ class NucleiTool(BaseTool):
 
 if __name__ == "__main__":
     tool = NucleiTool()
-    result = tool.run("http://192.168.12.128", mode="fast")
-    print(f"\n{'=' * 60}")
-    print(f"结果: {result['total']} 个漏洞，耗时 {result['elapsed']} 秒")
-    print(f"{'=' * 60}")
-    for f in result.get("findings", []):
-        if isinstance(f, dict):
-            print(f"[{f.get('severity', 'info').upper()}] {f.get('template-id')} - {f.get('matched-at')}")
+
+    # 连续跑两次，验证缓存问题已解决
+    print("=" * 60)
+    print("第 1 次扫描")
+    print("=" * 60)
+    r1 = tool.run("http://192.168.12.128", mode="fast")
+    print(f"结果: {r1['total']} 个漏洞\n")
+
+    print("=" * 60)
+    print("第 2 次扫描（应该也是 11 个）")
+    print("=" * 60)
+    r2 = tool.run("http://192.168.12.128", mode="fast")
+    print(f"结果: {r2['total']} 个漏洞")
